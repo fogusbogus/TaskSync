@@ -135,6 +135,25 @@ import Foundation
 		wait(id)
 	}
 	
+	public static func syncTask(with: URLRequest, completion: @Sendable @escaping (Data?, URLResponse?, Error?) -> Void) {
+		
+		//Get an id for the task (this will create a file)
+		let id = newId
+		
+		//Let's create an async task that we will wait to finish
+		let task = URLSession.shared.dataTask(with: with) { data, response, error in
+			Task { @MainActor in
+				completion(data, response, error)
+				//Make sure the task is removed. Duplication elsewhere in the wait? We cater for this, so stop whining.
+				remove(id)
+			}
+		}
+		
+		//Start it off and wait until it's completed
+		task.resume()
+		wait(id)
+	}
+	
 	public static func syncTaskWithValue<T: Sendable>(with: URL, defaultValue: T, completion: @Sendable @escaping (Data?, URLResponse?, Error?) -> T) -> T {
 		let id = newId
 		var ret : T = defaultValue
