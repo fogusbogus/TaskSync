@@ -5,10 +5,12 @@ import Foundation
  */
 
 /// Thread-safe task synchroniser
-@MainActor public class SyncTaskHelper {
+public class SyncTaskHelper {
+	
+	public static nonisolated(unsafe) var messageHook: ((_ type: String, _ message: String) -> Void)?
 	
 	/// The location of the download folder (the folder where we are storing the ids)
-	private static var _downloadFolder: String?
+	private nonisolated(unsafe) static var _downloadFolder: String?
 	
 	/// Get the location of the download folder, creating if required
 	public static var downloadFolder: String {
@@ -21,12 +23,12 @@ import Foundation
 			}
 			let finalPath = folder.appending(path: sub, directoryHint: .isDirectory)
 			do {
-				//Log.write(message: "Attempting to create folder '\(finalPath.absoluteString)'", type: "I")
+				messageHook?("I", "Attempting to create folder '\(finalPath.absoluteString)'")
 				try FileManager.default.createDirectory(at: finalPath, withIntermediateDirectories: true)
 				_downloadFolder = finalPath.path
 			}
 			catch let err {
-				//Log.error(err)
+				messageHook?("E", err.localizedDescription)
 				return FileManager.default.temporaryDirectory.absoluteString
 			}
 			return _downloadFolder!
@@ -61,7 +63,7 @@ import Foundation
 			let path = getPath(ret.uuidString)
 			//Create the file to reserve
 			FileManager.default.createFile(atPath: path, contents: "".data(using: .utf8))
-			
+			messageHook?("I", "id: \(ret) created")
 			return ret
 		}
 	}
@@ -83,6 +85,7 @@ import Foundation
 			try? FileManager.default.removeItem(atPath: path)
 			retry -= 1
 		}
+		messageHook?("I", "id: \(path) destroyed")
 	}
 	
 	/// Is the task in progress? (i.e. does the file exist?)
@@ -96,9 +99,14 @@ import Foundation
 	/// - Parameters:
 	///   - id: The task id
 	///   - process: Post-process callback
-	private static func wait(_ id: UUID, _ process: (() -> Bool)? = nil) {
+	private static func wait(_ id: UUID, task: URLSessionDataTask, _ process: (() -> Bool)? = nil) {
 		//If the file doesn't exist, neither does the task in our view
-		guard hasTask(id: id) else { return }
+		guard hasTask(id: id) else {
+			messageHook?("D", "task \(id) doesn't exist")
+			messageHook?("I", "Canceling task")
+			task.cancel()
+			return
+		}
 		
 		//If for some reason the file is removed we need to break out of the loop
 		var breakOut = false
@@ -114,6 +122,8 @@ import Foundation
 		}
 		//Make sure the task is removed
 		remove(id)
+		messageHook?("I", "Canceling task")
+		task.cancel()
 	}
 	
 	public static func syncTask(with: URL, completion: @Sendable @escaping (Data?, URLResponse?, Error?) -> Void) {
@@ -123,48 +133,26 @@ import Foundation
 		
 		//Let's create an async task that we will wait to finish
 		let task = URLSession.shared.dataTask(with: with) { data, response, error in
-			Task { @MainActor in
-				completion(data, response, error)
-				//Make sure the task is removed. Duplication elsewhere in the wait? We cater for this, so stop whining.
-				remove(id)
-			}
+			completion(data, response, error)
+			//Make sure the task is removed. Duplication elsewhere in the wait? We cater for this, so stop whining.
+			remove(id)
 		}
-		
+
 		//Start it off and wait until it's completed
 		task.resume()
-		wait(id)
+		wait(id, task: task)
 	}
 	
-	public static func syncTask(with: URLRequest, completion: @Sendable @escaping (Data?, URLResponse?, Error?) -> Void) {
-		
-		//Get an id for the task (this will create a file)
-		let id = newId
-		
-		//Let's create an async task that we will wait to finish
-		let task = URLSession.shared.dataTask(with: with) { data, response, error in
-			Task { @MainActor in
-				completion(data, response, error)
-				//Make sure the task is removed. Duplication elsewhere in the wait? We cater for this, so stop whining.
-				remove(id)
-			}
-		}
-		
-		//Start it off and wait until it's completed
-		task.resume()
-		wait(id)
-	}
-	
+
 	public static func syncTaskWithValue<T: Sendable>(with: URL, defaultValue: T, completion: @Sendable @escaping (Data?, URLResponse?, Error?) -> T) -> T {
 		let id = newId
-		var ret : T = defaultValue
+		nonisolated(unsafe) var ret : T = defaultValue
 		let task = URLSession.shared.dataTask(with: with) { data, response, error in
-			Task { @MainActor in
-				ret = completion(data, response, error)
-				remove(id)
-			}
+			ret = completion(data, response, error)
+			remove(id)
 		}
 		task.resume()
-		wait(id)
+		wait(id, task: task)
 		return ret
 	}
 	
@@ -173,29 +161,24 @@ import Foundation
 		let id = newId
 		let task = URLSession.shared.dataTask(with: with) { data, response, error in
 			completion(data, response, error)
-			Task { @MainActor in
-				remove(id)
-			}
+			remove(id)
 		}
 		task.resume()
-		wait(id)
+		wait(id, task: task)
 	}
 	
 	public static func syncTask(with: URL?, timeoutSeconds: Int, completion: @Sendable @escaping (Data?, URLResponse?, Error?) -> Void) {
 		guard let with = with else {
 			return
 		}
-		//Log.funcParams("syncTask", items: ["with": with.absoluteString, "timeoutSeconds": timeoutSeconds])
 		let id = newId
 		let endTS = Date.now.addingTimeInterval(Double(timeoutSeconds))
 		let task = URLSession.shared.dataTask(with: with) { data, response, error in
 			completion(data, response, error)
-			Task { @MainActor in
-				remove(id)
-			}
+			remove(id)
 		}
 		task.resume()
-		wait(id) {
+		wait(id, task: task) {
 			if Date.now > endTS {
 				task.cancel()
 				return true
@@ -208,18 +191,15 @@ import Foundation
 		guard let with = with else {
 			return defaultValue
 		}
-		//Log.funcParams("syncTask", items: ["with": with.absoluteString, "defaultValue":defaultValue, "timeoutSeconds": timeoutSeconds])
 		let id = newId
 		let endTS = Date.now.addingTimeInterval(Double(timeoutSeconds))
-		var ret = defaultValue
+		nonisolated(unsafe) var ret = defaultValue
 		let task = URLSession.shared.dataTask(with: with) { data, response, error in
-			Task { @MainActor in
-				ret = completion(data, response, error)
-				remove(id)
-			}
+			ret = completion(data, response, error)
+			remove(id)
 		}
 		task.resume()
-		wait(id) {
+		wait(id, task: task) {
 			if Date.now > endTS {
 				task.cancel()
 				return true
@@ -238,12 +218,10 @@ import Foundation
 		let endTS = Date.now.addingTimeInterval(Double(timeoutSeconds))
 		let task = URLSession.shared.uploadTask(with: with, from: with.httpBody) { data, response, error in
 			completion(data, response, error)
-			Task { @MainActor in
-				remove(id)
-			}
+			remove(id)
 		}
 		task.resume()
-		wait(id) {
+		wait(id, task: task) {
 			if Date.now > endTS {
 				task.cancel()
 				return true
